@@ -12,6 +12,22 @@ from app.services.openvas import openvas_service
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+@router.get("/status")
+def get_openvas_status():
+    """
+    Return the current OpenVAS integration status.
+    Always returns 200 so the frontend can show enabled/disabled state.
+    """
+    try:
+        connected = openvas_service.is_connected() if hasattr(openvas_service, "is_connected") else False
+    except Exception:
+        connected = False
+    return {
+        "enabled": connected,
+        "message": "OpenVAS connected." if connected else "OpenVAS not reachable — check OPENVAS_HOST in .env.",
+    }
+
+
 @router.post("/scan/quick", response_model=OpenVASScanResponse)
 def start_quick_scan(scan_in: OpenVASScanCreate):
     """

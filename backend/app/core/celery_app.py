@@ -6,16 +6,19 @@ celery_app = Celery(
     "worker",
     broker=settings.REDIS_URL,
     backend=settings.REDIS_URL,
-    include=['app.services.scan_tasks']
+    include=["app.services.scan_tasks"],
 )
 
-
-
-# Automated Scanning Schedule
 celery_app.conf.beat_schedule = {
+    # Periodic infrastructure scan (existing)
     "hourly-network-scan": {
         "task": "app.services.scan_tasks.trigger_periodic_scan",
-        "schedule": crontab(minute=0), # Run every hour
-        "args": ("localhost",), 
+        "schedule": crontab(minute=0),
+        "args": ("localhost",),
+    },
+    # Phase 4.3 — SLA breach detection runs every hour
+    "hourly-sla-breach-check": {
+        "task": "app.services.scan_tasks.check_sla_breaches",
+        "schedule": crontab(minute=5),  # offset by 5 min from the scan trigger
     },
 }

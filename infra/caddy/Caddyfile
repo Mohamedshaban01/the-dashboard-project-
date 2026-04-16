@@ -1,0 +1,53 @@
+# Found 404 — Caddy reverse proxy
+# Phase 3.4: TLS termination + internal routing
+#
+# Dev (default): Caddy auto-generates a self-signed certificate for localhost.
+#   Browser will show a security warning — accept it once.
+#   Access the app at https://localhost
+#
+# Prod: replace "localhost" with your real domain and set your email below.
+#   Caddy will automatically obtain a Let's Encrypt certificate.
+#
+# {
+#     email you@example.com
+# }
+
+localhost {
+    # ── API — route /api/v1/* and WebSocket /ws/* to the FastAPI backend ──
+    handle /api/* {
+        reverse_proxy backend:8000
+    }
+
+    handle /ws/* {
+        reverse_proxy backend:8000
+    }
+
+    handle /health {
+        reverse_proxy backend:8000
+    }
+
+    handle /openapi.json {
+        reverse_proxy backend:8000
+    }
+
+    handle /docs* {
+        reverse_proxy backend:8000
+    }
+
+    # ── Frontend — everything else goes to the Vite dev server ───────────
+    handle {
+        reverse_proxy frontend:5173
+    }
+
+    # Compress responses
+    encode gzip
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+}

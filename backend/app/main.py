@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import settings
 from app.api.api import api_router
 from app.api.v1.endpoints import lab as lab_endpoints
-from app.core.database import engine, Base
+
 from app.services.ws_manager import manager
 
 # ── Structured logging ──────────────────────────────────────────────────────
@@ -20,9 +20,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-# ── Database bootstrap (dev only — use Alembic in prod) ─────────────────────
-Base.metadata.create_all(bind=engine)
 
 # ── Redis event listener with exponential backoff ───────────────────────────
 _redis_listener_task: asyncio.Task | None = None
@@ -39,7 +36,7 @@ async def redis_event_listener() -> None:
             redis = await aioredis.from_url(
                 settings.REDIS_URL,
                 decode_responses=True,
-                socket_timeout=5,
+                socket_timeout=30,
                 socket_connect_timeout=5,
             )
             pubsub = redis.pubsub()
@@ -58,7 +55,10 @@ async def redis_event_listener() -> None:
         except Exception as exc:
             delay = min(2 ** attempt, 32)
             attempt += 1
-            logger.error("Redis listener error (attempt %d): %s — retrying in %ds", attempt, exc, delay)
+            # WARNING for first attempt (may be a real issue), DEBUG for subsequent
+            # reconnects (expected during quiet periods with socket_timeout firing)
+            log_fn = logger.warning if attempt == 1 else logger.debug
+            log_fn("Redis listener reconnect (attempt %d): %s — retrying in %ds", attempt, exc, delay)
             await asyncio.sleep(delay)
 
 
@@ -66,6 +66,21 @@ async def redis_event_listener() -> None:
 async def lifespan(app: FastAPI):
     """Application lifespan: reap orphans, start background tasks, clean up on shutdown."""
     global _redis_listener_task
+
+    # ── 0. Verify DB schema is up-to-date ────────────────────────────────────
+    # Alembic upgrade runs synchronously and can deadlock with asyncpg when
+    # both use the same DB server. Instead, just log the current revision.
+    # Run `docker compose exec backend alembic upgrade head` manually when
+    # new migrations are added.
+    try:
+        from app.core.database import engine
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).fetchone()
+            rev = row[0] if row else "unknown"
+        logger.info("DB schema at alembic revision: %s", rev)
+    except Exception as exc:
+        logger.warning("Could not read alembic_version: %s", exc)
 
     # ── 1. Reap orphaned scans before accepting new work ─────────────────────
     # Must run before the Redis listener so phantom RUNNING scans are cleared

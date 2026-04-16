@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 sqlalchemy
+alembic>=1.13.0
 aioredis
 pydantic-settings
 python-dotenv
@@ -17,3 +18,9 @@ reportlab
 requests
 python-gvm
 aiolimiter>=1.1.0
+# Phase 3.1 — JWT auth
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+bcrypt==4.0.1
+# Phase 3.2 — credential encryption
+cryptography>=42.0.0

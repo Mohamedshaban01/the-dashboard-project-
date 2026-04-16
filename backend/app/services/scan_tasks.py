@@ -330,6 +330,9 @@ def run_scan_task(self, scan_id: str, mode: str = "nmap"):
         except Exception as exc:
             logger.warning("[Scan %s] Asset monitor skipped: %s", scan_id, exc)
 
+        # ── Phase 4.2: Finding deduplication ───────────────────────────────
+        _run_finding_dedup(scan_id, str(scan.target_id) if scan.target_id else None)
+
         # ── Finalise: COMPLETED ────────────────────────────────────────────
         scan.status = ScanStatus.COMPLETED
         scan.completed_at = datetime.utcnow()
@@ -358,6 +361,42 @@ def run_scan_task(self, scan_id: str, mode: str = "nmap"):
         db.commit()
         if acquired_lock and scan and scan.target_id:
             _release_scan_lock(str(scan.target_id))
+        db.close()
+
+
+# ── Phase 4.2: Finding deduplication (called after each scan) ─────────────────
+
+def _run_finding_dedup(scan_id: str, target_id: str | None) -> None:
+    """Run finding deduplication in a synchronous DB session."""
+    db = SessionLocal()
+    try:
+        from app.services.finding_dedup import deduplicate_scan
+        new_findings = deduplicate_scan(scan_id, target_id, db)
+        logger.info("[Scan %s] Finding dedup: %d new findings.", scan_id, new_findings)
+    except Exception as exc:
+        logger.warning("[Scan %s] Finding dedup failed: %s", scan_id, exc)
+    finally:
+        db.close()
+
+
+# ── Phase 4.3: SLA breach detection (hourly Celery beat task) ─────────────────
+
+@celery_app.task
+def check_sla_breaches():
+    """
+    Detect OPEN Findings past their SLA due_date, create OVERDUE ActionItems,
+    and publish sla_breach events. Registered in celery_app.beat_schedule.
+    """
+    db = SessionLocal()
+    try:
+        from app.services.sla import check_and_action_breaches
+        count = check_and_action_breaches(db)
+        logger.info("SLA breach check completed: %d breaches actioned.", count)
+        return count
+    except Exception as exc:
+        logger.error("SLA breach check failed: %s", exc)
+        return 0
+    finally:
         db.close()
 
 

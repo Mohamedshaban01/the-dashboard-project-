@@ -1,49 +1,35 @@
+"""
+Manual unit test for UnifiedRiskEngine.
+Tests score/penalty logic without requiring a database session.
+"""
+from app.services.unified_risk_engine import UnifiedRiskEngine
+from app.models.scan import SeverityLevel
 
-from app.services.risk_engine import RiskCalculator, ActionGenerator
-import json
 
-# Mock Data
-mock_scan_data = {
-    "assets": [
-        {
-            "ip": "192.168.1.10",
-            "ports": [
-                {"port": 80, "state": "open", "service": "http"},
-                {"port": 23, "state": "open", "service": "telnet"}, # High Risk
-                {"port": 445, "state": "open", "service": "microsoft-ds"} # Critical Risk
-            ]
-        }
-    ],
-    "vulnerabilities": [
-        {
-            "host": "192.168.1.10",
-            "severity": "HIGH",
-            "description": "Old Apache Version",
-            "cve_id": "CVE-2023-XXXX"
-        }
-    ]
-}
+def test_high_risk_port_weights():
+    """Verify telnet and SMB carry the expected deduction weights."""
+    assert UnifiedRiskEngine.HIGH_RISK_PORTS[23][1] == 20,  "Telnet should carry 20-pt penalty"
+    assert UnifiedRiskEngine.HIGH_RISK_PORTS[445][1] == 20, "SMB should carry 20-pt penalty"
+    print("✅ High-risk port weights verified")
 
-def test_risk_engine():
-    print("Testing Risk Engine...")
-    
-    # 1. Test Score
-    score = RiskCalculator.calculate(mock_scan_data)
-    print(f"Calculated Score: {score}")
-    
-    # Expected: 100 - 15 (Telnet) - 15 (SMB) - 10 (High Vuln) = 60
-    assert score <= 70, f"Score {score} is too high!"
-    print("✅ Score Calculation Verified")
 
-    # 2. Test Actions
-    actions = ActionGenerator.generate_actions(mock_scan_data)
-    print(f"Generated {len(actions)} Actions:")
-    for a in actions:
-        print(f" - [{a['priority']}] {a['title']}")
+def test_severity_weights():
+    """Verify severity → score deduction mapping."""
+    assert UnifiedRiskEngine.SEVERITY_WEIGHTS[SeverityLevel.CRITICAL] == 25
+    assert UnifiedRiskEngine.SEVERITY_WEIGHTS[SeverityLevel.HIGH] == 15
+    assert UnifiedRiskEngine.SEVERITY_WEIGHTS[SeverityLevel.LOW] == 2
+    print("✅ Severity weights verified")
 
-    assert any(a['title'] == "Disable Telnet on 192.168.1.10" for a in actions)
-    assert any(a['title'] == "Check SMB Security on 192.168.1.10" for a in actions)
-    print("✅ Action Generation Verified")
+
+def test_asset_value_multipliers():
+    """Verify asset criticality multipliers."""
+    assert UnifiedRiskEngine.ASSET_VALUE_MAP["CRITICAL"] == 1.5
+    assert UnifiedRiskEngine.ASSET_VALUE_MAP["MEDIUM"] == 1.0
+    print("✅ Asset value multipliers verified")
+
 
 if __name__ == "__main__":
-    test_risk_engine()
+    test_high_risk_port_weights()
+    test_severity_weights()
+    test_asset_value_multipliers()
+    print("\nAll manual risk engine tests passed.")

@@ -4,6 +4,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from app.models.scan import Scan, Vulnerability, ScanStatus, SeverityLevel, VulnStatus, ActionItem, ScanAsset, AssetService, NetworkAsset
+from app.services.cvss import (
+    environmental_score as cvss_env_score,
+    parse_vector,
+    severity_to_default_vector,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,56 +50,113 @@ class UnifiedRiskEngine:
         # Ensure HIGH_RISK_PORTS is available as explicit float for linter
         self.port_weights: dict = self.__class__.HIGH_RISK_PORTS
 
+    def _resolve_target_context(self, scan: Scan) -> tuple[str, str, str]:
+        """Return (asset_value, data_sensitivity, exposure) from the scan's target."""
+        asset_value = "MEDIUM"
+        data_sensitivity = "NONE"
+        exposure = "external"
+        target_ip = ""
+
+        if scan.target:
+            target_ip = scan.target.base_url or scan.target_url or ""
+            if hasattr(scan.target, "asset_value") and scan.target.asset_value:
+                asset_value = str(scan.target.asset_value).upper()
+            if hasattr(scan.target, "data_sensitivity") and scan.target.data_sensitivity:
+                data_sensitivity = str(scan.target.data_sensitivity).upper()
+
+        _private = ("10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.",
+                    "172.2", "172.30.", "172.31.", "127.", "localhost")
+        if any(target_ip.startswith(p) for p in _private):
+            exposure = "internal"
+
+        return asset_value, data_sensitivity, exposure
+
     def calculate_scan_risk(self, scan: Scan) -> float:
         """
-        Calculates a global risk score for a scan (0-100).
-        Logic:
-        1. Start with aggregate penalties from all vulnerabilities.
-        2. Apply asset-specific multipliers.
-        3. Normalize to 0-100 scale where 100 is "Maximum Risk".
+        Legacy scalar interface — delegates to calculate_scan_risk_v2 and returns
+        just the score float for backward compatibility.
+        """
+        return self.calculate_scan_risk_v2(scan)["score"]
+
+    def calculate_scan_risk_v2(self, scan: Scan) -> dict:
+        """
+        Phase 4.1 — CVSS v3.1 environmental risk score with per-vulnerability breakdown.
+
+        Algorithm:
+        1. For each vulnerability, obtain a CVSS vector (stored or default from severity).
+        2. Compute the CVSS environmental score adjusted for asset_value, data_sensitivity,
+           and whether the target is internet-exposed.
+        3. Add a confidence multiplier (0-1) from Nuclei where available.
+        4. Accumulate scores; cap at 100.
+        5. Return {"score": float, "breakdown": [...]} and store on Scan.risk_breakdown.
         """
         if not scan.vulnerabilities and not scan.assets:
-            return 0.0
+            return {"score": 0.0, "breakdown": []}
 
-        total_penalty = 0.0
-        
-        # 1. Vulnerability Penalties
+        asset_value, data_sensitivity, exposure = self._resolve_target_context(scan)
+        breakdown: list[dict] = []
+        total_score = 0.0
+
+        # ── Vulnerability contributions ───────────────────────────────────────
         for vuln in scan.vulnerabilities:
-            penalty = self.SEVERITY_WEIGHTS.get(vuln.severity, 0)
-            # Confidence multiplier (if tool provided)
-            confidence = vuln.confidence_score if vuln.confidence_score is not None else 1.0
-            total_penalty += float(penalty) * float(confidence)
+            # Resolve CVSS vector — prefer stored value, fall back to severity default
+            vector_str = vuln.cvss_vector if vuln.cvss_vector else severity_to_default_vector(
+                vuln.severity.value if vuln.severity else "low"
+            )
+            try:
+                metrics = parse_vector(vector_str)
+                env_score = cvss_env_score(metrics, asset_value, data_sensitivity, exposure)
+            except Exception:
+                env_score = float(UnifiedRiskEngine.SEVERITY_WEIGHTS.get(vuln.severity, 2))
 
-        # 2. Port Penalties (from ScanAssets)
+            confidence = float(vuln.confidence_score) if vuln.confidence_score is not None else 1.0
+            contribution = round(env_score * confidence, 2)
+            total_score += contribution
+
+            reason_parts = []
+            if vuln.cve_id:
+                reason_parts.append(vuln.cve_id)
+            if vuln.title:
+                reason_parts.append(vuln.title)
+            elif vuln.type:
+                reason_parts.append(vuln.type)
+            reason = ", ".join(reason_parts) if reason_parts else (vuln.description or "")[:80]
+
+            breakdown.append({
+                "vuln_id": vuln.id,
+                "cvss_vector": vector_str,
+                "cvss_env_score": round(env_score, 2),
+                "confidence": confidence,
+                "contribution": contribution,
+                "severity": vuln.severity.value if vuln.severity else "low",
+                "reason": reason,
+                "url": vuln.url or "",
+            })
+
+        # ── Port-exposure contributions (kept for infra scans) ─────────────
         for asset in scan.assets:
             for service in asset.services:
-                ports_map = UnifiedRiskEngine.HIGH_RISK_PORTS
-                if isinstance(ports_map, dict) and service.port in ports_map:
-                    port_data = ports_map[service.port]
-                    if isinstance(port_data, tuple) and len(port_data) >= 2:
-                        _, penalty = port_data
-                        total_penalty += float(penalty)
+                port_data = UnifiedRiskEngine.HIGH_RISK_PORTS.get(service.port)
+                if port_data:
+                    name, weight = port_data
+                    # Use a conservative CVSS-like score scaled from the weight
+                    port_score = round(weight * 0.3, 2)  # max weight 20 → ~6.0
+                    total_score += port_score
+                    breakdown.append({
+                        "vuln_id": None,
+                        "cvss_vector": None,
+                        "cvss_env_score": port_score,
+                        "confidence": 1.0,
+                        "contribution": port_score,
+                        "severity": "high" if weight >= 15 else "medium",
+                        "reason": f"Exposed {name} service (port {service.port}) on {asset.ip_address}",
+                        "url": f"{service.protocol or 'tcp'}://{asset.ip_address}:{service.port}",
+                    })
 
-        # 3. Asset Criticality Multiplier
-        target_val = "MEDIUM"
-        target_ip = ""
-        if scan.target:
-            target_ip = scan.target.base_url if scan.target else scan.target_url or ""
-            if hasattr(scan.target, 'asset_value'):
-                target_val = str(scan.target.asset_value).upper()
-        
-        asset_multiplier = self.ASSET_VALUE_MAP.get(target_val, 1.0)
-        
-        # 4. Exposure Modifier
-        # Standard private block detection (RFC 1918)
-        exposure_multiplier = 1.0  # Assume public by default
-        if any(target_ip.startswith(prefix) for prefix in ['10.', '192.168.', '172.16.', '172.17.', '172.18.', '172.19.', '172.2', '172.30.', '172.31.', '127.', 'localhost']):
-            exposure_multiplier = 0.6  # Internal/NAT asset
-            
-        final_score = total_penalty * asset_multiplier * exposure_multiplier
+        final_score = round(min(100.0, total_score), 2)
+        breakdown.sort(key=lambda x: x["contribution"], reverse=True)
 
-        # Normalize/Cap
-        return min(100.0, final_score)
+        return {"score": final_score, "breakdown": breakdown}
 
     def calculate_health_score(self, scan: Scan) -> float:
         """
@@ -125,34 +187,34 @@ class UnifiedRiskEngine:
         return max(0.0, score_val)
 
     async def update_scan_risk(self, scan_id: str) -> float:
-        """Calculates and saves both Risk and Health scores."""
+        """Calculates and saves Risk score, Health score, and the CVSS breakdown."""
         _s_res = await self.db.execute(
             select(Scan)
             .options(
-                selectinload(Scan.vulnerabilities), 
+                selectinload(Scan.vulnerabilities),
                 selectinload(Scan.assets).selectinload(ScanAsset.services),
                 selectinload(Scan.target)
             )
             .filter(Scan.id == scan_id)
         )
         scan = _s_res.scalars().first()
-        
+
         if scan:
-            risk_score = self.calculate_scan_risk(scan)
+            result = self.calculate_scan_risk_v2(scan)
+            risk_score = result["score"]
             health_score = self.calculate_health_score(scan)
-            
-            # We store the deterministic risk_score in the main field for now
+
             scan.risk_score = risk_score
-            # We can store health_score in agent_thoughts for the UI to pick up
+            scan.risk_breakdown = result  # {"score": ..., "breakdown": [...]}
+
             if not isinstance(scan.agent_thoughts, dict):
                 scan.agent_thoughts = {}
-            
             thoughts: dict = scan.agent_thoughts
             thoughts["health_score"] = health_score
             scan.agent_thoughts = thoughts
-            
+
             await self.db.commit()
-            logger.info(f"Updated scores for scan {scan_id}: Risk={risk_score}, Health={health_score}")
+            logger.info("Updated scores for scan %s: Risk=%.2f, Health=%.2f", scan_id, risk_score, health_score)
             return risk_score
         return 0.0
 

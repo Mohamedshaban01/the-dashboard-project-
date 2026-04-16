@@ -2,7 +2,7 @@
 found 404 Database Models
 Extended models for AI-driven DAST platform
 """
-from sqlalchemy import Column, Integer, String, Float, DateTime, Enum, ForeignKey, Text, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Float, DateTime, Enum, ForeignKey, Text, Boolean, JSON, Date, UniqueConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime
 import enum
@@ -110,6 +110,11 @@ class Scan(Base):
     started_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 
+    # ── Phase 4.1: CVSS risk breakdown ───────────────────────────────────────
+    risk_breakdown = Column(JSON, nullable=True)
+    # Structured breakdown produced by UnifiedRiskEngine.calculate_scan_risk_v2()
+    # Format: {"score": 74.3, "breakdown": [{"vuln_id": ..., "cvss": ..., ...}]}
+
     # ── Phase 2 reliability fields ─────────────────────────────────────────────
     failure_reason = Column(String(128), nullable=True)
     # Known values:
@@ -195,16 +200,72 @@ class Vulnerability(Base):
     remediation_steps = Column(Text, nullable=True) # Actionable steps
 
     # ── Nuclei evidence fields (Phase 1.2 hardening) ──────────────────────────
-    # Every finding produced by Nuclei MUST have these populated.
-    # Legacy findings (pre-hardening) will have NULL values here.
-    raw_request = Column(Text, nullable=True)          # Full HTTP request sent by Nuclei
-    raw_response = Column(Text, nullable=True)         # Full HTTP response received
-    evidence_hash = Column(String(64), nullable=True)  # sha256(raw_request + raw_response)
-    detected_by = Column(String(32), nullable=True)    # "nuclei" | "recon" | "manual"
-    template_id = Column(String(128), nullable=True)   # Nuclei template ID or ZAP rule ID
+    raw_request = Column(Text, nullable=True)
+    raw_response = Column(Text, nullable=True)
+    evidence_hash = Column(String(64), nullable=True)
+    detected_by = Column(String(32), nullable=True)
+    template_id = Column(String(128), nullable=True)
+
+    # ── Phase 4.1: CVSS fields ─────────────────────────────────────────────────
+    cvss_vector = Column(String(128), nullable=True)   # e.g. "CVSS:3.1/AV:N/AC:L/..."
+    cvss_score = Column(Float, nullable=True)          # Parsed base score 0-10
+
+    # ── Phase 4.2: Finding deduplication FK ───────────────────────────────────
+    finding_id = Column(String(36), ForeignKey("findings.id"), nullable=True, index=True)
 
     scan = relationship("Scan", back_populates="vulnerabilities")
+    finding = relationship("Finding", back_populates="observations")
 
+
+
+# ============================================================================
+# FINDINGS  (Phase 4.2 — deduplication lifecycle)
+# ============================================================================
+
+class FindingStatus(str, enum.Enum):
+    OPEN = "open"
+    FIXED = "fixed"
+    ACCEPTED = "accepted"
+    REOPENED = "reopened"
+    FALSE_POSITIVE = "false_positive"
+
+
+class Finding(Base):
+    """
+    Deduplicated, persistent record of a security issue per target.
+    Vulnerabilities are *observations* of a Finding — the same issue
+    re-detected on a second scan links to the existing Finding row.
+
+    Fingerprint is sha256(target_id + vuln_type + normalised_url + parameter
+                          + evidence_match_signature) and is unique per target.
+    """
+    __tablename__ = "findings"
+    __table_args__ = (
+        UniqueConstraint("target_id", "fingerprint", name="uq_finding_target_fingerprint"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    target_id = Column(String(36), ForeignKey("targets.id"), nullable=True, index=True)
+    fingerprint = Column(String(64), nullable=False, index=True)
+
+    title = Column(String(255), nullable=False)
+    vuln_type = Column(String(100), nullable=True)
+    severity = Column(Enum(SeverityLevel), default=SeverityLevel.LOW)
+    cvss_score = Column(Float, nullable=True)
+
+    status = Column(Enum(FindingStatus), default=FindingStatus.OPEN)
+    first_seen = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_seen = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # SLA clock (Phase 4.3)
+    due_date = Column(Date, nullable=True)
+
+    # Ownership
+    owner_user_id = Column(String(36), nullable=True)
+
+    # Relationships
+    target = relationship("Target")
+    observations = relationship("Vulnerability", back_populates="finding")
 
 
 # ============================================================================

@@ -80,14 +80,43 @@ class BaseAgent(ABC):
         await manager.broadcast(f"[{self.name.upper()}] {action}")
         logger.info(f"[{self.name}] {action}")
     
-    def llm_reason(self, prompt: str) -> str:
-        """Send prompt to LLM and get reasoned response"""
+    def llm_reason(self, prompt: str, internal_hostnames: list[str] | None = None) -> str:
+        """
+        Send a redacted prompt to the LLM and return the response.
+
+        Phase 3.3 hardening:
+        - LLM_PROVIDER=none short-circuits immediately (no network call).
+        - Prompt is redacted for cookies, auth headers, PII, and internal hosts
+          before leaving the process.
+        - Both the daily budget and the per-scan circuit breaker are checked;
+          if either is exceeded, an empty string is returned so the caller's
+          deterministic path still works.
+        """
+        if settings.LLM_PROVIDER == "none":
+            return ""
+
         llm = self.llm
         if llm is None:
             return "[LLM not configured - demo mode]"
+
+        # ── Redact sensitive data ────────────────────────────────────────────
+        from app.services.llm_guard import (
+            LLMBudgetExceeded, estimate_tokens, get_daily_budget, redact,
+        )
+        safe_prompt = redact(prompt, internal_hostnames=internal_hostnames)
+
+        # ── Check budgets ────────────────────────────────────────────────────
+        estimated = estimate_tokens(safe_prompt)
         try:
-            # Type-safe model interaction
-            response = llm.generate_content(prompt)
+            get_daily_budget().consume(estimated)
+            if hasattr(self, "_circuit_breaker") and self._circuit_breaker is not None:
+                self._circuit_breaker.consume(estimated)
+        except LLMBudgetExceeded as exc:
+            logger.error("LLM budget exceeded — skipping LLM call: %s", exc)
+            return ""
+
+        try:
+            response = llm.generate_content(safe_prompt)
             return str(response.text)
         except Exception as e:
             logger.error(f"LLM error: {e}")

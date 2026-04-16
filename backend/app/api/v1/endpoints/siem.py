@@ -21,6 +21,22 @@ def _check_siem_enabled():
         )
 
 
+@router.get("/status")
+async def get_siem_status():
+    """
+    Return the current SIEM integration status without requiring connectivity.
+    Always returns 200 so the frontend can show enabled/disabled state.
+    """
+    return {
+        "enabled": getattr(settings, "SIEM_ENABLED", False),
+        "message": (
+            "SIEM integration is active."
+            if getattr(settings, "SIEM_ENABLED", False)
+            else "SIEM integration is disabled. Set SIEM_ENABLED=true in .env to activate."
+        ),
+    }
+
+
 @router.get("/alerts")
 async def get_siem_alerts(index: str = "wazuh-alerts-*", size: int = 100):
     """

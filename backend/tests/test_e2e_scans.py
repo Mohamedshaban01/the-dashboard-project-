@@ -8,6 +8,17 @@ from sqlalchemy import create_engine, text
 API_URL = "http://localhost:8000/api/v1"
 DB_URL = "postgresql://user:password@db:5432/sme_cyber_db"
 
+# ── Auth fixture ──────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def auth_headers():
+    """Login and return Authorization headers for all API calls."""
+    resp = requests.post(f"{API_URL}/auth/login", json={"email": "test@local", "password": "Pass123"})
+    assert resp.status_code == 200, f"Login failed: {resp.text}"
+    token = resp.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
 @pytest.fixture(scope="module")
 def db_connection():
     """Wait for DB to be ready and return connection"""
@@ -24,51 +35,48 @@ def db_connection():
             retries -= 1
     pytest.fail("Database connection failed")
 
-def test_api_health():
-    """Ensure API is running"""
-    response = requests.get(f"{API_URL}/scans/")
+def test_api_health(auth_headers):
+    """Ensure API is running and scans endpoint is reachable"""
+    response = requests.get(f"{API_URL}/scans/", headers=auth_headers)
     assert response.status_code == 200
 
-def test_trigger_scan():
+def test_trigger_scan(auth_headers):
     """Trigger a scan and ensure it returns a valid ID"""
-    payload = {"target": "localhost", "scan_type": "quick"}
-    response = requests.post(f"{API_URL}/scans/", json=payload)
+    payload = {"target_url": "http://lab_webserver:3000", "scan_type": "quick"}
+    response = requests.post(f"{API_URL}/scans/", json=payload, headers=auth_headers)
     assert response.status_code == 200
     data = response.json()
     assert "id" in data
-    assert data["status"] == "PENDING"
+    assert data["status"] == "queued"
     return data["id"]
 
-def test_scan_completion_and_assets(db_connection):
+def test_scan_completion_and_assets(auth_headers, db_connection):
     """Wait for scan to complete and verify assets created in DB"""
-    scan_id = test_trigger_scan()
+    scan_id = test_trigger_scan(auth_headers)
     print(f"Tracking Scan ID: {scan_id}")
 
     # Poll for completion (max 20s)
     max_retries = 20
-    status = "PENDING"
-    while max_retries > 0 and status != "COMPLETED" and status != "FAILED":
+    status = "queued"
+    while max_retries > 0 and status not in ("completed", "failed"):
         time.sleep(1)
-        response = requests.get(f"{API_URL}/scans/{scan_id}")
+        response = requests.get(f"{API_URL}/scans/{scan_id}", headers=auth_headers)
         status = response.json()["status"]
         max_retries -= 1
-    
-    assert status == "COMPLETED", "Scan did not complete in time"
+
+    assert status == "completed", f"Scan did not complete in time (status: {status})"
 
     # Verify Assets in DB
-    result = db_connection.execute(text(f"SELECT count(*) FROM scan_assets WHERE scan_id = {scan_id}"))
+    result = db_connection.execute(text("SELECT count(*) FROM scan_assets WHERE scan_id = :sid"), {"sid": scan_id})
     asset_count = result.scalar()
     print(f"Assets found: {asset_count}")
-    # Nmap localhost scan should find at least the host itself
     assert asset_count is not None
-    assert asset_count >= 0 # Might be 0 if docker networking is strict, but query should work
+    assert asset_count >= 0
 
-def test_report_generation():
+def test_report_generation(auth_headers):
     """Verify Report API properly calls Mock/Real advisor"""
-    # Use a likely existing scan ID or create one
-    scan_id = test_trigger_scan()
-    time.sleep(5) # Let it run a bit
-    
-    response = requests.get(f"{API_URL}/reports/{scan_id}")
-    # Note: Report might fail if scan isn't done, but API should respond
-    assert response.status_code in [200, 404] 
+    scan_id = test_trigger_scan(auth_headers)
+    time.sleep(5)
+
+    response = requests.get(f"{API_URL}/reports/{scan_id}", headers=auth_headers)
+    assert response.status_code in [200, 404]
